@@ -6,6 +6,8 @@
 //! all look like that, they just differ in which headers and transfer encodings they use.
 
 use std::collections::HashMap;
+use std::error::Error;
+use std::fmt;
 use std::io::{self, Write};
 
 use base64::alphabet;
@@ -36,6 +38,7 @@ const BASE64_LENIENT: GeneralPurpose = GeneralPurpose::new(
 pub type Headers = Vec<(String, String)>;
 
 /// A single part of an MHTML archive, already decoded.
+#[derive(Debug)]
 pub struct ArchivedAsset {
     pub data: Vec<u8>,
     /// Content-Location of the part, resolved into a full URL (None if the part doesn't have one)
@@ -48,11 +51,36 @@ pub struct ArchivedAsset {
     pub response_headers: Option<Vec<(String, String)>>,
 }
 
+#[derive(Debug)]
 pub struct MhtmlArchive {
     assets: Vec<ArchivedAsset>,
     /// Lookup table: URL (without fragment) or "cid:<Content-ID>" -> index in assets
     index: HashMap<String, usize>,
     root: usize,
+    /// Whether parts of nested MHTML archives got unpacked into this one (see parse_nested_mhtml)
+    nested: bool,
+    /// Scope (multipart node ID) each asset came from, by asset index; empty for flat archives
+    asset_scopes: Vec<usize>,
+    /// Scope each URL index entry belongs to, by its key; absent for flat archives
+    entry_scopes: HashMap<String, usize>,
+    /// Parent scope of every scope, by scope ID; the root scope's parent is None
+    scope_parents: HashMap<usize, usize>,
+}
+
+/// Errors nested unpacking can run into (RFC 2557 structure problems that make the result ambiguous).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MhtmlError(pub String);
+
+impl fmt::Display for MhtmlError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl Error for MhtmlError {}
+
+fn mhtml_error(message: impl Into<String>) -> MhtmlError {
+    MhtmlError(message.into())
 }
 
 impl MhtmlArchive {
@@ -62,6 +90,10 @@ impl MhtmlArchive {
             assets: Vec::with_capacity(assets.len()),
             index: HashMap::new(),
             root: 0,
+            nested: false,
+            asset_scopes: Vec::new(),
+            entry_scopes: HashMap::new(),
+            scope_parents: HashMap::new(),
         };
 
         for (i, (urls, asset)) in assets.into_iter().enumerate() {
@@ -79,8 +111,72 @@ impl MhtmlArchive {
         &self.assets[self.root]
     }
 
+    /// Scope the document itself belongs to.
+    pub fn root_scope(&self) -> Option<usize> {
+        self.asset_scopes.get(self.root).copied()
+    }
+
+    /// Whether parts of nested MHTML archives got unpacked into this one.
+    pub fn is_nested(&self) -> bool {
+        self.nested
+    }
+
     pub fn get(&self, url: &Url) -> Option<&ArchivedAsset> {
         self.index.get(&archive_key(url)).map(|i| &self.assets[*i])
+    }
+
+    /// Same as get(), but for Content-ID references it only looks in the scope the referencing
+    /// part belongs to and in the scopes around it (never in sibling packages, see parse_nested_mhtml).
+    pub fn get_for(&self, parent_url: &Url, url: &Url) -> Option<&ArchivedAsset> {
+        let key: String = archive_key(url);
+        if !url.scheme().eq_ignore_ascii_case("cid") || self.asset_scopes.is_empty() {
+            return self.index.get(&key).map(|i| &self.assets[*i]);
+        }
+
+        // What's making the request says which scope it belongs to
+        let parent_key: String = archive_key(parent_url);
+        let mut scope: Option<usize> = self
+            .entry_scopes
+            .get(&parent_key)
+            .copied()
+            .or_else(|| {
+                self.index
+                    .get(&parent_key)
+                    .and_then(|i| self.asset_scopes.get(*i))
+                    .copied()
+            })
+            // The document itself (or a part without a recorded location) asks from the root scope
+            .or_else(|| self.asset_scopes.get(self.root).copied());
+
+        // Walk up the containers: the package it belongs to first, then every ancestor of it.
+        // Sibling packages never answer, and when the requesting part's scope is known there's no
+        // global fallback: a CID that none of its containers define is simply not there.
+        while let Some(current) = scope {
+            if let Some(&i) = self.index.get(&scoped_cid_key(&key, current)) {
+                return Some(&self.assets[i]);
+            }
+            scope = self.scope_parents.get(&current).copied();
+        }
+
+        // Only requests without a known scope (parts outside the scoped tree) use the flat lookup
+        let parent_known = self
+            .entry_scopes
+            .contains_key(&parent_key)
+            || self.index.contains_key(&parent_key);
+        if parent_known {
+            None
+        } else {
+            self.index.get(&key).map(|i| &self.assets[*i])
+        }
+    }
+
+    /// Scope the asset known by given URL belongs to, if any.
+    pub fn scope_of(&self, url: &Url) -> Option<usize> {
+        let key: String = archive_key(url);
+        self.entry_scopes
+            .get(&key)
+            .copied()
+            .or_else(|| self.index.get(&key).and_then(|i| self.asset_scopes.get(*i)).copied())
     }
 
     pub fn contains(&self, url: &Url) -> bool {
@@ -95,6 +191,12 @@ impl MhtmlArchive {
     pub fn is_empty(&self) -> bool {
         self.assets.is_empty()
     }
+}
+
+/// Key under which a Content-ID gets indexed within its specific scope (synthetic, never a real URL).
+fn scoped_cid_key(cid_key: &str, scope: usize) -> String {
+    // cid_key is "cid:<id>", the scope suffix makes same-named IDs in different packages distinct
+    format!("{cid_key}@{scope}")
 }
 
 fn archive_key(url: &Url) -> String {
@@ -117,97 +219,27 @@ pub fn is_mhtml(data: &[u8]) -> bool {
 /// Unpacks an MHTML archive.
 /// Relative Content-Location values get resolved against the archive's own location (if it has one), or fallback_url.
 /// Returns None if the data isn't an MHTML archive, or if there's nothing in it.
+///
+/// This is the flat, original mode: every part of the top-level message becomes an asset, parts that
+/// are MHTML archives themselves stay packed. See parse_nested_mhtml() for the nested mode.
 pub fn parse_mhtml(data: &[u8], fallback_url: Option<&Url>) -> Option<MhtmlArchive> {
-    let (headers, body) = parse_headers(data, true)?;
-    let (boundary, start) = multipart_boundary(&headers)?;
-
-    // Base URL for relative Content-Location values
-    let base_url: Option<Url> = [
-        "content-location",
-        "content-base",
-        "snapshot-content-location",
-    ]
-    .iter()
-    .filter_map(|name| get_header(&headers, name))
-    .find_map(|value| Url::parse(value.trim()).ok())
-    .or_else(|| fallback_url.cloned());
+    let (parts, start) = split_parts(data, fallback_url)?;
 
     let mut archive = MhtmlArchive {
-        assets: Vec::new(),
+        assets: Vec::with_capacity(parts.len()),
         index: HashMap::new(),
         root: 0,
+        nested: false,
+        asset_scopes: Vec::new(),
+        entry_scopes: HashMap::new(),
+        scope_parents: HashMap::new(),
     };
     let mut root: Option<usize> = None;
 
-    for part in split_multipart(body, &boundary) {
-        let (part_headers, part_body) = parse_headers(part, false).unwrap_or_default();
-
-        let (mut media_type, params) =
-            parse_content_type(get_header(&part_headers, "content-type").unwrap_or_default());
-        let charset: String = params.get("charset").cloned().unwrap_or_default();
-
-        let data: Vec<u8> = match get_header(&part_headers, "content-transfer-encoding")
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "base64" => decode_base64(part_body),
-            "quoted-printable" => decode_quoted_printable(part_body),
-            _ => part_body.to_vec(), // 7bit, 8bit, binary
-        };
-
-        let url: Option<Url> = get_header(&part_headers, "content-location").and_then(|location| {
-            let location = location.trim();
-            Url::parse(location).ok().or_else(|| {
-                base_url
-                    .as_ref()
-                    .and_then(|base_url| base_url.join(location).ok())
-            })
-        });
-
-        let content_id: Option<String> = get_header(&part_headers, "content-id")
-            .map(|id| {
-                id.trim()
-                    .trim_start_matches('<')
-                    .trim_end_matches('>')
-                    .to_string()
-            })
-            .filter(|id| !id.is_empty());
-
-        if media_type.is_empty() {
-            media_type = match &url {
-                Some(url) => detect_media_type(&data, url),
-                None => detect_media_type(&data, &Url::parse("data:,").unwrap()),
-            };
-        }
-
+    for part in parts {
         let i: usize = archive.assets.len();
-
-        // Parts that come first win, in case there are duplicates
-        if let Some(url) = &url
-            && url.scheme() != "data"
-        {
-            archive.index.entry(archive_key(url)).or_insert(i);
-        }
-        if let Some(content_id) = &content_id {
-            archive
-                .index
-                .entry(format!("cid:{}", content_id))
-                .or_insert(i);
-
-            if root.is_none() && start.as_deref() == Some(content_id.as_str()) {
-                root = Some(i);
-            }
-        }
-
-        archive.assets.push(ArchivedAsset {
-            data,
-            url,
-            media_type,
-            charset,
-            response_headers: None,
-        });
+        index_part(&mut archive.index, &part, i, &mut root, start.as_deref());
+        archive.assets.push(part.into_asset());
     }
 
     if archive.assets.is_empty() {
@@ -224,6 +256,525 @@ pub fn parse_mhtml(data: &[u8], fallback_url: Option<&Url>) -> Option<MhtmlArchi
     });
 
     Some(archive)
+}
+
+/// Same as parse_mhtml(), but unpacking nested MHTML archives recursively: parts that are themselves
+/// MHTML messages (multipart/related, multipart/mixed, multipart/alternative, or message/rfc822) get
+/// unpacked, and the document to process gets chosen out of the whole tree.
+///
+/// Root selection, per multipart node:
+/// - multipart/related: the part named by the "start" parameter (its direct child), or the first child
+/// - multipart/mixed: the first child branch that leads to an HTML document
+/// - multipart/alternative: the last child (the richest alternative)
+///
+/// Content-ID references get resolved in the package the referencing part belongs to first, then in
+/// every package around it (ancestors); sibling packages never answer. Same-named Content-IDs in the
+/// same package are ambiguous and rejected, same-named IDs in different packages both stay usable.
+///
+/// Relative Content-Location values get resolved against the container part's own location, then
+/// against each surrounding container's, and finally against fallback_url. Nothing is fetched:
+/// a referenced part that isn't in the archive is an error reported by the caller while walking.
+pub fn parse_nested_mhtml(
+    data: &[u8],
+    fallback_url: Option<&Url>,
+) -> Result<MhtmlArchive, MhtmlError> {
+    let (headers, body) =
+        parse_headers(data, true).ok_or_else(|| mhtml_error("not an MHTML archive"))?;
+    let (boundary, _) =
+        multipart_boundary(&headers).ok_or_else(|| mhtml_error("not an MHTML archive"))?;
+    let base_url = message_base_url(&headers, fallback_url);
+
+    let mut builder = TreeBuilder {
+        next_scope: 0,
+        scope_parents: HashMap::new(),
+    };
+    let (media_type, params) =
+        parse_content_type(get_header(&headers, "content-type").unwrap_or_default());
+    let start: Option<String> = start_of(&params);
+    let root_node: Node = builder.parse_multipart(
+        body,
+        &boundary,
+        None,
+        base_url.as_ref(),
+        media_type,
+        start,
+    )?;
+    let root_part: &Part = root_node
+        .selected()?
+        .ok_or_else(|| mhtml_error("MHTML archive has no HTML document in it"))?;
+    if !is_html_media_type(&root_part.asset.media_type) {
+        return Err(mhtml_error(format!(
+            "selected part is not an HTML document ({}), nothing to save",
+            root_part.asset.media_type
+        )));
+    }
+
+    let mut archive = MhtmlArchive {
+        assets: Vec::new(),
+        index: HashMap::new(),
+        root: 0,
+        nested: true,
+        asset_scopes: Vec::new(),
+        entry_scopes: HashMap::new(),
+        scope_parents: builder.scope_parents,
+    };
+
+    // Every leaf of the tree becomes an asset; the selected root is remembered by its part
+    flatten_node(
+        &root_node,
+        &mut archive,
+        &mut HashMap::new(),
+        Some(root_part),
+    )?;
+
+    if archive.assets.is_empty() {
+        return Err(mhtml_error("MHTML archive has nothing in it"));
+    }
+
+    Ok(archive)
+}
+
+/// A part of a multipart message, headers parsed and body decoded.
+struct RawPart {
+    data: Vec<u8>,
+    media_type: String,
+    charset: String,
+    url: Option<Url>,
+    content_id: Option<String>,
+}
+
+impl RawPart {
+    fn into_asset(self) -> ArchivedAsset {
+        ArchivedAsset {
+            data: self.data,
+            url: self.url,
+            media_type: self.media_type,
+            charset: self.charset,
+            response_headers: None,
+        }
+    }
+}
+
+/// A leaf part, with the scope (multipart node ID) it belongs to.
+struct Part {
+    scope: usize,
+    asset: ArchivedAsset,
+    content_id: Option<String>,
+}
+
+/// A node of the parsed MIME tree: either a leaf part or a multipart container with its children.
+enum Node {
+    Leaf(Part),
+    Multipart {
+        scope: usize,
+        media_type: String,
+        /// Content-ID named by the "start" parameter, if the container had one
+        start: Option<String>,
+        children: Vec<Node>,
+    },
+}
+
+impl Node {
+    /// The leaf that documents inside this node should be taken from.
+    /// An invalid "start" parameter (no direct child with that Content-ID) is an error.
+    fn selected(&self) -> Result<Option<&Part>, MhtmlError> {
+        match self {
+            Node::Leaf(part) => Ok(Some(part)),
+            Node::Multipart {
+                media_type,
+                start,
+                children,
+                scope,
+            } => {
+                if media_type == "multipart/related" {
+                    let Some(child) = (if let Some(start) = start {
+                        // The part "start" names has to be a direct child of this container
+                        let found = children
+                            .iter()
+                            .find(|child| child.direct_content_id() == Some(start.as_str()));
+                        if found.is_none() {
+                            return Err(mhtml_error(format!(
+                                "multipart/related node (scope {scope}) has no part with Content-ID \"{start}\" named by its start parameter"
+                            )));
+                        }
+                        found
+                    } else {
+                        children.first()
+                    }) else {
+                        return Ok(None);
+                    };
+                    child.selected()
+                } else if media_type == "multipart/alternative" {
+                    // The last alternative is the richest one
+                    match children.last() {
+                        Some(child) => child.selected(),
+                        None => Ok(None),
+                    }
+                } else {
+                    // multipart/mixed: the first branch that leads to an HTML document
+                    for child in children {
+                        if let Some(part) = child.selected()?
+                            && is_html_media_type(&part.asset.media_type)
+                        {
+                            return Ok(Some(part));
+                        }
+                    }
+                    Ok(None)
+                }
+            }
+        }
+    }
+
+    /// Content-ID of this node when it's a leaf part, None otherwise (for direct-child "start" matching).
+    fn direct_content_id(&self) -> Option<&str> {
+        match self {
+            Node::Leaf(part) => part.content_id.as_deref(),
+            Node::Multipart { .. } => None,
+        }
+    }
+}
+
+struct TreeBuilder {
+    next_scope: usize,
+    scope_parents: HashMap<usize, usize>,
+}
+
+impl TreeBuilder {
+    fn new_scope(&mut self, parent: Option<usize>) -> usize {
+        let scope: usize = self.next_scope;
+        self.next_scope += 1;
+        if let Some(parent) = parent {
+            self.scope_parents.insert(scope, parent);
+        }
+        scope
+    }
+
+    /// Parses a multipart body into a tree of nodes.
+    fn parse_multipart(
+        &mut self,
+        body: &[u8],
+        boundary: &str,
+        parent_scope: Option<usize>,
+        parent_base_url: Option<&Url>,
+        media_type: String,
+        start: Option<String>,
+    ) -> Result<Node, MhtmlError> {
+        let scope: usize = self.new_scope(parent_scope);
+        let mut children: Vec<Node> = Vec::new();
+        // Content-IDs of direct leaf children: duplicates within one package are ambiguous
+        let mut content_ids: HashMap<String, ()> = HashMap::new();
+
+        for raw in split_multipart(body, boundary) {
+            let (headers, part_body) = parse_headers(raw, false).unwrap_or_default();
+            let (child_media_type, params) =
+                parse_content_type(get_header(&headers, "content-type").unwrap_or_default());
+            let part_base_url = part_base_url(&headers, parent_base_url);
+
+            if let Some((child_boundary, _)) = multipart_node_boundary(&headers) {
+                // A nested multipart message (related, mixed, or alternative)
+                let node = self.parse_multipart(
+                    part_body,
+                    &child_boundary,
+                    Some(scope),
+                    part_base_url.as_ref(),
+                    child_media_type,
+                    start_of(&params),
+                )?;
+                children.push(node);
+                continue;
+            }
+
+            if child_media_type == "message/rfc822" {
+                // A whole MIME message packed as a part: its own headers and body follow
+                let node = self
+                    .parse_message(part_body, Some(scope), part_base_url.as_ref())?
+                    .ok_or_else(|| mhtml_error("empty message/rfc822 part"))?;
+                children.push(node);
+                continue;
+            }
+
+            let part = decode_part(headers, part_body, part_base_url.as_ref());
+
+            // A leaf part that is itself an MHTML archive: either declared so, or an unnamed part
+            // whose body is a MIME message (nested messages often have no part-level Content-Type)
+            let looks_like_message = is_mhtml(&part.data)
+                || parse_headers(&part.data, true)
+                    .and_then(|(headers, _)| multipart_node_boundary(&headers))
+                    .is_some();
+            if let Some(node) = looks_like_message
+                .then(|| {
+                    self.parse_message(
+                        &part.data,
+                        Some(scope),
+                        part.url.as_ref().or(part_base_url.as_ref()),
+                    )
+                })
+                .transpose()?
+                .flatten()
+            {
+                children.push(node);
+                continue;
+            }
+
+            if let Some(content_id) = &part.content_id
+                && content_ids.insert(content_id.clone(), ()).is_some()
+            {
+                return Err(mhtml_error(format!(
+                    "duplicate Content-ID \"{content_id}\" in the same MHTML package"
+                )));
+            }
+
+            let content_id = part.content_id.clone();
+            children.push(Node::Leaf(Part {
+                scope,
+                asset: part.into_asset(),
+                content_id,
+            }));
+        }
+
+        if children.is_empty() {
+            return Err(mhtml_error("MHTML multipart node has no parts"));
+        }
+
+        Ok(Node::Multipart {
+            scope,
+            media_type,
+            start,
+            children,
+        })
+    }
+
+    /// Parses a standalone MIME message (headers + multipart body), as found in message/rfc822 parts.
+    fn parse_message(
+        &mut self,
+        data: &[u8],
+        parent_scope: Option<usize>,
+        parent_base_url: Option<&Url>,
+    ) -> Result<Option<Node>, MhtmlError> {
+        // A nested message may be preceded by blank lines (part padding); skip them
+        let data = data
+            .iter()
+            .position(|&b| b != b'\r' && b != b'\n')
+            .map(|start| &data[start..])
+            .unwrap_or(data);
+        let Some((headers, body)) = parse_headers(data, false) else {
+            return Ok(None);
+        };
+        let Some((boundary, _)) = multipart_node_boundary(&headers) else {
+            return Ok(None);
+        };
+        let (media_type, params) =
+            parse_content_type(get_header(&headers, "content-type").unwrap_or_default());
+        let base_url = message_base_url(&headers, parent_base_url.cloned().as_ref());
+        Ok(Some(self.parse_multipart(
+            body,
+            &boundary,
+            parent_scope,
+            base_url.as_ref(),
+            media_type,
+            start_of(&params),
+        )?))
+    }
+}
+
+/// Flattens the tree into archive assets, remembering each part's scope and building the lookup index.
+fn flatten_node<'a>(
+    node: &'a Node,
+    archive: &mut MhtmlArchive,
+    content_ids_by_scope: &mut HashMap<(usize, String), ()>,
+    selected: Option<&'a Part>,
+) -> Result<(), MhtmlError> {
+    match node {
+        Node::Leaf(part) => {
+            let index: usize = archive.assets.len();
+            if selected.is_some_and(|selected| std::ptr::eq(selected, part)) {
+                archive.root = index;
+            }
+            archive.asset_scopes.push(part.scope);
+
+            if let Some(url) = &part.asset.url
+                && url.scheme() != "data"
+            {
+                let key = archive_key(url);
+                archive.index.entry(key.clone()).or_insert(index);
+                archive.entry_scopes.entry(key).or_insert(part.scope);
+            }
+            if let Some(content_id) = &part.content_id {
+                let cid_key: String = format!("cid:{content_id}");
+                // Same Content-ID in the same package was already rejected while building the tree;
+                // the guard also covers IDs repeated across flattened branches of one scope
+                if content_ids_by_scope
+                    .insert((part.scope, content_id.clone()), ())
+                    .is_some()
+                    && !archive
+                        .index
+                        .contains_key(&scoped_cid_key(&cid_key, part.scope))
+                {
+                    return Err(mhtml_error(format!(
+                        "duplicate Content-ID \"{content_id}\" in the same MHTML package"
+                    )));
+                }
+                // Scoped entry: same-named IDs in inner and outer packages both stay usable
+                archive
+                    .index
+                    .entry(scoped_cid_key(&cid_key, part.scope))
+                    .or_insert(index);
+                archive
+                    .entry_scopes
+                    .entry(scoped_cid_key(&cid_key, part.scope))
+                    .or_insert(part.scope);
+                // The unscoped entry keeps the closest (deepest) part for flat lookups
+                archive.index.entry(cid_key.clone()).or_insert(index);
+                archive.entry_scopes.entry(cid_key).or_insert(part.scope);
+            }
+
+            archive.assets.push(clone_asset(&part.asset));
+            Ok(())
+        }
+        Node::Multipart { children, .. } => {
+            for child in children {
+                // Only the branch the selection points at can contain the selected part
+                let child_selected = selected.filter(|selected| node_contains(child, selected));
+                flatten_node(child, archive, content_ids_by_scope, child_selected)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Whether given node is the selected part itself or a container around it.
+fn node_contains<'a>(node: &'a Node, selected: &'a Part) -> bool {
+    match node {
+        Node::Leaf(part) => std::ptr::eq(part, selected),
+        Node::Multipart { children, .. } => {
+            children.iter().any(|child| node_contains(child, selected))
+        }
+    }
+}
+
+fn clone_asset(asset: &ArchivedAsset) -> ArchivedAsset {
+    ArchivedAsset {
+        data: asset.data.clone(),
+        url: asset.url.clone(),
+        media_type: asset.media_type.clone(),
+        charset: asset.charset.clone(),
+        response_headers: asset.response_headers.clone(),
+    }
+}
+
+/// Splits the top-level message into its decoded parts (flat mode), with the "start" Content-ID.
+fn split_parts(data: &[u8], fallback_url: Option<&Url>) -> Option<(Vec<RawPart>, Option<String>)> {
+    let (headers, body) = parse_headers(data, true)?;
+    let (boundary, start) = multipart_boundary(&headers)?;
+    let base_url = message_base_url(&headers, fallback_url);
+
+    let parts: Vec<RawPart> = split_multipart(body, &boundary)
+        .into_iter()
+        .map(|raw| {
+            let (part_headers, part_body) = parse_headers(raw, false).unwrap_or_default();
+            let part_base_url = part_base_url(&part_headers, base_url.as_ref());
+            decode_part(part_headers, part_body, part_base_url.as_ref())
+        })
+        .collect();
+
+    (!parts.is_empty()).then_some((parts, start))
+}
+
+/// Decodes one part: transfer encoding, media type, charset, Content-Location and Content-ID.
+fn decode_part(headers: Headers, body: &[u8], base_url: Option<&Url>) -> RawPart {
+    let (mut media_type, params) =
+        parse_content_type(get_header(&headers, "content-type").unwrap_or_default());
+    let charset: String = params.get("charset").cloned().unwrap_or_default();
+
+    let data: Vec<u8> = match get_header(&headers, "content-transfer-encoding")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "base64" => decode_base64(body),
+        "quoted-printable" => decode_quoted_printable(body),
+        _ => body.to_vec(), // 7bit, 8bit, binary
+    };
+
+    let url: Option<Url> = get_header(&headers, "content-location").and_then(|location| {
+        let location = location.trim();
+        Url::parse(location).ok().or_else(|| {
+            base_url
+                .as_ref()
+                .and_then(|base_url| base_url.join(location).ok())
+        })
+    });
+
+    let content_id: Option<String> = get_header(&headers, "content-id")
+        .map(|id| {
+            id.trim()
+                .trim_start_matches('<')
+                .trim_end_matches('>')
+                .to_string()
+        })
+        .filter(|id| !id.is_empty());
+
+    if media_type.is_empty() {
+        media_type = match &url {
+            Some(url) => detect_media_type(&data, url),
+            None => detect_media_type(&data, &Url::parse("data:,").unwrap()),
+        };
+    }
+
+    RawPart {
+        data,
+        media_type,
+        charset,
+        url,
+        content_id,
+    }
+}
+
+/// Adds a flat-mode part to the lookup index and tracks the "start"-named root.
+fn index_part(
+    index: &mut HashMap<String, usize>,
+    part: &RawPart,
+    i: usize,
+    root: &mut Option<usize>,
+    start: Option<&str>,
+) {
+    // Parts that come first win, in case there are duplicates
+    if let Some(url) = &part.url
+        && url.scheme() != "data"
+    {
+        index.entry(archive_key(url)).or_insert(i);
+    }
+    if let Some(content_id) = &part.content_id {
+        index
+            .entry(format!("cid:{}", content_id))
+            .or_insert(i);
+
+        if root.is_none() && start == Some(content_id.as_str()) {
+            *root = Some(i);
+        }
+    }
+}
+
+/// Base URL declared by a message itself (Content-Location/Content-Base/Snapshot-Content-Location).
+fn message_base_url(headers: &Headers, fallback_url: Option<&Url>) -> Option<Url> {
+    [
+        "content-location",
+        "content-base",
+        "snapshot-content-location",
+    ]
+    .iter()
+    .filter_map(|name| get_header(headers, name))
+    .find_map(|value| Url::parse(value.trim()).ok())
+    .or_else(|| fallback_url.cloned())
+}
+
+/// Base URL for parts of a message: the part's own absolute Content-Location wins, otherwise
+/// it inherits the container's base URL, so relative locations resolve layer by layer.
+fn part_base_url(headers: &Headers, parent_base_url: Option<&Url>) -> Option<Url> {
+    get_header(headers, "content-location")
+        .and_then(|location| Url::parse(location.trim()).ok())
+        .or_else(|| parent_base_url.cloned())
 }
 
 /// Packs the document and all assets it references into an MHTML archive.
@@ -402,6 +953,8 @@ fn is_html_media_type(media_type: &str) -> bool {
 }
 
 /// Returns the multipart boundary and the Content-ID of the root part ("start" parameter, if given).
+/// Top-level MHTML archives are multipart/related or multipart/mixed; multipart/alternative only
+/// appears as a node of a nested archive (see multipart_node_boundary).
 fn multipart_boundary(headers: &Headers) -> Option<(String, Option<String>)> {
     let (media_type, params) = parse_content_type(get_header(headers, "content-type")?);
 
@@ -409,16 +962,39 @@ fn multipart_boundary(headers: &Headers) -> Option<(String, Option<String>)> {
         return None;
     }
 
-    let boundary: String = params.get("boundary").filter(|b| !b.is_empty())?.clone();
-    let start: Option<String> = params.get("start").map(|start| {
+    Some((boundary_of(&params)?, start_of(&params)))
+}
+
+/// Same as multipart_boundary(), but also accepting multipart/alternative: nodes nested inside
+/// an MHTML archive can be of any of the three multipart types.
+fn multipart_node_boundary(headers: &Headers) -> Option<(String, Option<String>)> {
+    let (media_type, params) = parse_content_type(get_header(headers, "content-type")?);
+
+    if media_type != "multipart/related"
+        && media_type != "multipart/mixed"
+        && media_type != "multipart/alternative"
+    {
+        return None;
+    }
+
+    Some((boundary_of(&params)?, start_of(&params)))
+}
+
+fn boundary_of(params: &HashMap<String, String>) -> Option<String> {
+    params
+        .get("boundary")
+        .filter(|b| !b.is_empty())
+        .cloned()
+}
+
+fn start_of(params: &HashMap<String, String>) -> Option<String> {
+    params.get("start").map(|start| {
         start
             .trim()
             .trim_start_matches('<')
             .trim_end_matches('>')
             .to_string()
-    });
-
-    Some((boundary, start))
+    })
 }
 
 fn get_header<'a>(headers: &'a Headers, name: &str) -> Option<&'a str> {

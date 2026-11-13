@@ -26,7 +26,8 @@ use crate::html::{
     strip_elements, targets_element_anywhere, walk,
 };
 use crate::mhtml::{
-    ArchivedAsset, MhtmlArchive, is_mhtml, parse_mhtml, percent_decode, write_mhtml_document,
+    ArchivedAsset, MhtmlArchive, is_mhtml, parse_mhtml, parse_nested_mhtml, percent_decode,
+    write_mhtml_document,
 };
 use crate::replay::{
     CapturedAsset, CapturedPage, create_replay_markup, exchanges_of, is_html, is_script,
@@ -134,6 +135,8 @@ pub struct MonolithOptions {
     pub ignore_errors: bool,
     pub insecure: bool,
     pub isolate: bool,
+    /// Unpack MHTML archives nested inside parts of MHTML archives (off by default, see parse_nested_mhtml)
+    pub nested_mhtml: bool,
     pub remove_styles: bool,
     pub remove_fonts: bool,
     pub remove_images: bool,
@@ -313,10 +316,13 @@ fn create_monolithic_document_from_bytes(
     // the only source of its assets
     if is_mhtml(&input_data) {
         let archive_url: Option<Url> = input_target.as_deref().and_then(|t| Url::parse(t).ok());
-        archive = Some(
+        archive = Some(if session.options.nested_mhtml {
+            parse_nested_mhtml(&input_data, archive_url.as_ref())
+                .map_err(|error| MonolithError::new(&error.to_string()))?
+        } else {
             parse_mhtml(&input_data, archive_url.as_ref())
-                .ok_or(MonolithError::new("could not unpack MHTML archive"))?,
-        );
+                .ok_or(MonolithError::new("could not unpack MHTML archive"))?
+        });
     } else if is_webarchive(&input_data) {
         archive = Some(
             parse_webarchive(&input_data)
@@ -564,6 +570,15 @@ fn create_monolithic_document_from_bytes(
 
     for key in input_target_aliases {
         session.leave_expansion_alias(&key);
+    }
+
+    // Nested MHTML mode never goes online: a referenced part that's missing makes the result
+    // incomplete, so that's a fatal error instead of a document with remote references left in it
+    if !session.missing_assets().is_empty() {
+        return Err(MonolithError::new(&format!(
+            "missing from nested MHTML archive: {}",
+            session.missing_assets().join(", ")
+        )));
     }
 
     if session.is_recording() {

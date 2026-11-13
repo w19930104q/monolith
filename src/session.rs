@@ -152,6 +152,9 @@ pub struct Session {
     /// What STYLE elements a browser has made out of constructed stylesheets are marked with,
     /// those aren't up to policies
     pub(crate) adopted_style_marker: Option<String>,
+    /// URLs of assets referenced by documents out of a nested MHTML archive that aren't in it.
+    /// Nested mode treats those as fatal instead of leaving remote references behind (see mhtml.rs)
+    missing_assets: Vec<String>,
     /// What Content-Security-Policy headers have said, by URL (see received_policy())
     received_policies: HashMap<String, String>,
     /// Title to name the result by, instead of what the document says
@@ -250,6 +253,7 @@ impl Session {
             received_policies: HashMap::new(),
             title: None,
             warc: None,
+            missing_assets: Vec::new(),
         }
     }
 
@@ -380,7 +384,11 @@ impl Session {
         if let Some((_, headers)) = self.recorded_headers.get(&key) {
             return recorded_content_security_policy(headers);
         }
-        if let Some(archived) = self.archive.as_ref().and_then(|archive| archive.get(url)) {
+        if let Some(archived) = self
+            .archive
+            .as_ref()
+            .and_then(|archive| archive.get_for(url, url))
+        {
             return archived
                 .response_headers
                 .as_deref()
@@ -668,6 +676,12 @@ impl Session {
         self.archive.is_some() || self.is_offline
     }
 
+    /// URLs referenced out of a nested MHTML archive that none of its parts provide, if any.
+    /// Nested mode turns those into a fatal error after the document has been walked.
+    pub fn missing_assets(&self) -> &[String] {
+        &self.missing_assets
+    }
+
     /// Makes the session take everything from given archives (see read_archives()), and
     /// nothing from anywhere else: targets are URLs of pages in them.
     pub fn use_archives(&mut self, archives: &[Arc<Vec<u8>>]) {
@@ -801,8 +815,10 @@ impl Session {
             let (media_type, charset, data) = parse_data_url(url);
             Ok(Some((data, url.clone(), media_type, charset)))
         } else if let Some(archive) = &self.archive {
-            // Documents that come from MHTML archives get assets from the archive, never from the network or filesystem
-            let asset = archive.get(url).map(|asset| {
+            // Documents that come from MHTML archives get assets from the archive, never from the network or filesystem.
+            // Content-ID references stay inside the package the requesting part belongs to (see mhtml.rs)
+            let archived = archive.get_for(parent_url, url);
+            let asset = archived.map(|asset| {
                 (
                     asset.data.clone(),
                     asset.url.clone().unwrap_or_else(|| url.clone()),
@@ -811,7 +827,7 @@ impl Session {
                 )
             });
             // What other origins allowed is known only for what has been received over HTTP
-            let is_blocked = match (cors.as_ref(), archive.get(url)) {
+            let is_blocked = match (cors.as_ref(), archived) {
                 (Some(cors), Some(archived)) => {
                     archived.response_headers.as_ref().is_some_and(|headers| {
                         !cors.allows_recorded(archived.url.as_ref().unwrap_or(url), headers)
@@ -843,6 +859,13 @@ impl Session {
                 None => {
                     if !self.options.silent {
                         print_error_message(&format!("{} (not found in archive)", cache_key));
+                    }
+                    if self.archive.as_ref().is_some_and(MhtmlArchive::is_nested) {
+                        // Nested mode has to produce the whole page out of the archive: what's
+                        // missing stays missing instead of being fetched, and gets reported as an error
+                        if !self.missing_assets.contains(&cache_key) {
+                            self.missing_assets.push(cache_key.clone());
+                        }
                     }
 
                     // Provoke error

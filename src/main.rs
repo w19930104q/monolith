@@ -92,6 +92,11 @@ struct Cli {
     #[arg(short = 'j', long)]
     remove_js: bool,
 
+    /// Unpack MHTML archives nested inside parts of an MHTML archive: the embedded web page gets
+    /// extracted recursively (multipart/mixed, /related and /alternative); off by default
+    #[arg(short = 'N', long)]
+    nested: bool,
+
     /// Allow invalid X.509 (TLS) certificates
     #[arg(short = 'k', long)]
     insecure: bool,
@@ -263,6 +268,7 @@ fn main() {
         options.ignore_errors = cli.ignore_errors;
         options.insecure = cli.insecure;
         options.isolate = cli.isolate;
+        options.nested_mhtml = cli.nested;
         options.remove_styles = cli.remove_styles;
         options.remove_fonts = cli.remove_fonts;
         options.remove_images = cli.remove_images;
